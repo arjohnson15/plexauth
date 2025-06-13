@@ -15,10 +15,14 @@ const Logger = require('./lib/logger');
 class PlexAuthProxy {
   constructor() {
     this.app = express();
+    this.app.set('trust proxy', true);  // Fix for X-Forwarded-For header warning
     this.config = this.loadConfig();
     this.logger = new Logger(this.config.logging);
     this.plexAuth = new PlexAuthenticator(this.config, this.logger);
     this.accessControl = new AccessControl(this.config, this.logger);
+    
+    // Store for pending OAuth sessions
+    this.pendingAuth = new Map(); // pinId -> { redirect, timestamp, pollingInterval }
     
     this.setupMiddleware();
     this.setupRoutes();
@@ -36,17 +40,21 @@ class PlexAuthProxy {
   }
 
   setupMiddleware() {
+    // Set trust proxy first
+    this.app.set('trust proxy', ['192.168.10.0/24', '172.16.0.0/12', '10.0.0.0/8']);
+    
     // Security middleware
     this.app.use(helmet({
       crossOriginEmbedderPolicy: false,
-      contentSecurityPolicy: false // We'll handle CSP ourselves if needed
+      contentSecurityPolicy: false
     }));
 
-    // Rate limiting
+    // Rate limiting with specific proxy configuration
     const limiter = rateLimit({
       windowMs: this.config.security.rate_limit.window_ms,
       max: this.config.security.rate_limit.max_requests,
-      message: 'Too many requests from this IP, please try again later.'
+      message: 'Too many requests from this IP, please try again later.',
+      trustProxy: ['192.168.10.0/24', '172.16.0.0/12', '10.0.0.0/8']
     });
     this.app.use(limiter);
 
@@ -96,13 +104,99 @@ class PlexAuthProxy {
       }
     });
 
-    // Login page
-    this.app.get('/login', (req, res) => {
-      const originalUrl = req.query.redirect || req.headers.referer || '/';
-      res.send(this.generateLoginPage(originalUrl));
+    // Login page - creates PIN and shows Plex login with polling
+    this.app.get('/login', async (req, res) => {
+      try {
+        const originalUrl = req.query.redirect || req.headers.referer || '/';
+        
+        // Create OAuth URL first
+        const redirectUrl = `${req.protocol}://${req.get('host')}/auth/waiting`;
+        const { authUrl, pinId } = await this.plexAuth.createAuthUrl(redirectUrl);
+        
+        // Store the pending auth session
+        this.pendingAuth.set(pinId, {
+          redirect: originalUrl,
+          timestamp: Date.now()
+        });
+        
+        // Clean up old pending auths
+        this.cleanupPendingAuth();
+        
+        res.send(this.generateOAuthLoginPage(authUrl, pinId, originalUrl));
+      } catch (error) {
+        this.logger.error('Failed to create login page:', error);
+        res.status(500).send('Authentication service temporarily unavailable');
+      }
     });
 
-    // Login handler
+    // Waiting page that polls for authentication completion
+this.app.get('/auth/waiting', async (req, res) => {
+  try {
+    // The user just came back from Plex, but we need to find their PIN
+    // Let's check all pending authentications to see if any completed
+    for (const [pinId, pending] of this.pendingAuth.entries()) {
+      const authResult = await this.plexAuth.checkAuthToken(pinId);
+      
+      if (authResult.success) {
+        // Authentication successful!
+        req.session.user = authResult.user;
+        req.session.plexServers = authResult.servers;
+        
+        this.logger.info(`User ${authResult.user.email} authenticated successfully`);
+        
+        // Clean up and redirect
+        this.pendingAuth.delete(pinId);
+        return res.redirect(pending.redirect);
+      }
+    }
+    
+    // No successful auth found, show waiting page
+    res.send(this.generateWaitingPage());
+  } catch (error) {
+    this.logger.error('Waiting page error:', error);
+    res.send(this.generateWaitingPage());
+  }
+});
+    // API endpoint to check auth status (polled by waiting page)
+    this.app.get('/auth/check/:pinId', async (req, res) => {
+      try {
+        const pinId = req.params.pinId;
+        
+        const pending = this.pendingAuth.get(pinId);
+        if (!pending) {
+          return res.json({ status: 'expired', message: 'Authentication session expired' });
+        }
+
+        // Check for auth token
+        const authResult = await this.plexAuth.checkAuthToken(pinId);
+        
+        if (authResult.success) {
+          // Store user session
+          req.session.user = authResult.user;
+          req.session.plexServers = authResult.servers;
+          
+          this.logger.info(`User ${authResult.user.email} authenticated successfully via OAuth`);
+          
+          // Clean up pending auth
+          this.pendingAuth.delete(pinId);
+          
+          // Return success with redirect URL
+          res.json({ 
+            status: 'success', 
+            redirect: pending.redirect,
+            user: authResult.user.email
+          });
+        } else {
+          // Still waiting
+          res.json({ status: 'waiting', message: 'Waiting for Plex authentication...' });
+        }
+      } catch (error) {
+        this.logger.error('Auth check error:', error);
+        res.json({ status: 'error', message: 'Authentication failed' });
+      }
+    });
+
+    // Legacy login handler (for direct username/password - optional)
     this.app.post('/login', async (req, res) => {
       try {
         const { username, password, redirect } = req.body;
@@ -156,8 +250,8 @@ class PlexAuthProxy {
 
     // Check if user is authenticated
     if (!req.session.user) {
-      this.logger.debug('User not authenticated, redirecting to login');
-      return res.redirect(`/login?redirect=${encodeURIComponent(originalUrl || '/')}`);
+      this.logger.debug('User not authenticated, returning 401');
+      return res.status(401).json({ error: 'Not authenticated' });
     }
 
     // Check access control
@@ -197,7 +291,7 @@ class PlexAuthProxy {
     });
   }
 
-  generateLoginPage(redirectUrl) {
+  generateOAuthLoginPage(authUrl, pinId, redirectUrl) {
     return `
 <!DOCTYPE html>
 <html lang="en">
@@ -217,129 +311,236 @@ class PlexAuthProxy {
         }
         .login-container {
             background: white;
-            padding: 2rem;
-            border-radius: 10px;
-            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+            padding: 3rem;
+            border-radius: 15px;
+            box-shadow: 0 15px 35px rgba(0,0,0,0.2);
             width: 100%;
-            max-width: 400px;
-        }
-        .logo {
+            max-width: 450px;
             text-align: center;
-            margin-bottom: 2rem;
         }
-        .logo img {
-            width: 100px;
-            height: auto;
+        .logo h2 {
+            color: #333;
+            margin: 0 0 2rem 0;
+            font-size: 1.8rem;
         }
-        .form-group {
-            margin-bottom: 1rem;
+        .plex-btn {
+            background: #e5a00d;
+            color: white;
+            padding: 1rem 2rem;
+            border: none;
+            border-radius: 8px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.3s, transform 0.2s;
+            text-decoration: none;
+            display: inline-block;
+            margin: 1rem 0;
+            min-width: 250px;
         }
-        label {
-            display: block;
-            margin-bottom: 0.5rem;
-            font-weight: 500;
+        .plex-btn:hover {
+            background: #cc9900;
+            transform: translateY(-2px);
+        }
+        .info-text {
+            color: #666;
+            margin: 1.5rem 0;
+            line-height: 1.5;
+        }
+        .steps {
+            text-align: left;
+            margin: 2rem 0;
+            padding: 1.5rem;
+            background: #f8f9fa;
+            border-radius: 8px;
+        }
+        .steps h4 {
+            margin: 0 0 1rem 0;
             color: #333;
         }
-        input[type="text"], input[type="password"] {
-            width: 100%;
-            padding: 0.75rem;
-            border: 2px solid #e1e1e1;
-            border-radius: 5px;
-            font-size: 1rem;
-            transition: border-color 0.3s;
+        .steps ol {
+            margin: 0;
+            padding-left: 1.2rem;
         }
-        input[type="text"]:focus, input[type="password"]:focus {
-            outline: none;
-            border-color: #667eea;
+        .steps li {
+            margin-bottom: 0.5rem;
+            color: #555;
         }
-        .btn {
-            width: 100%;
-            padding: 0.75rem;
-            background: #667eea;
-            color: white;
-            border: none;
-            border-radius: 5px;
-            font-size: 1rem;
-            cursor: pointer;
-            transition: background 0.3s;
+        .status {
+            margin-top: 2rem;
+            padding: 1rem;
+            border-radius: 8px;
+            background: #e3f2fd;
+            color: #1976d2;
+            display: none;
         }
-        .btn:hover {
-            background: #5a67d8;
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #e5a00d;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            animation: spin 1s linear infinite;
+            display: inline-block;
+            margin-right: 10px;
         }
-        .error {
-            color: #e53e3e;
-            margin-top: 0.5rem;
-            font-size: 0.9rem;
-        }
-        .help-text {
-            text-align: center;
-            margin-top: 1rem;
-            color: #666;
-            font-size: 0.9rem;
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
         }
     </style>
 </head>
 <body>
     <div class="login-container">
         <div class="logo">
-            <h2>🎬 Plex Authentication</h2>
+            <h2>?? Plex Authentication</h2>
         </div>
         
-        <form id="loginForm" method="POST" action="/login">
-            <input type="hidden" name="redirect" value="${redirectUrl}">
-            
-            <div class="form-group">
-                <label for="username">Email or Username</label>
-                <input type="text" id="username" name="username" required>
-            </div>
-            
-            <div class="form-group">
-                <label for="password">Password</label>
-                <input type="password" id="password" name="password" required>
-            </div>
-            
-            <button type="submit" class="btn">Sign In</button>
-            
-            <div id="error" class="error" style="display: none;"></div>
-        </form>
+        <div class="info-text">
+            Sign in with your Plex account to access this service
+        </div>
         
-        <div class="help-text">
-            Use your Plex account credentials to sign in
+        <a href="${authUrl}" class="plex-btn" onclick="startPolling()" target="_blank">
+            Sign in with Plex
+        </a>
+        
+        <div class="status" id="status">
+            <div class="spinner"></div>
+            <span id="statusText">Waiting for Plex authentication...</span>
+        </div>
+        
+        <div class="steps">
+            <h4>How it works:</h4>
+            <ol>
+                <li>Click "Sign in with Plex" above</li>
+                <li>Sign in to your Plex account on plex.tv</li>
+                <li>Return to this tab - authentication will complete automatically</li>
+                <li>You'll be redirected to your requested page</li>
+            </ol>
         </div>
     </div>
 
     <script>
-        document.getElementById('loginForm').addEventListener('submit', async function(e) {
-            e.preventDefault();
+        const pinId = '${pinId}';  // Pass pinId to JavaScript
+        let polling = false;
+        let pollInterval;
+        
+        function startPolling() {
+            if (polling) return;
+            polling = true;
             
-            const formData = new FormData(this);
-            const errorDiv = document.getElementById('error');
+            document.getElementById('status').style.display = 'block';
             
-            try {
-                const response = await fetch('/login', {
-                    method: 'POST',
-                    body: formData
-                });
-                
-                if (response.ok) {
-                    const data = await response.json();
-                    if (data.success) {
-                        window.location.href = formData.get('redirect') || '/';
+            // Start polling after a short delay to let user get to Plex
+            setTimeout(() => {
+                pollInterval = setInterval(checkAuthStatus, 3000);
+            }, 5000);
+        }
+        
+        function checkAuthStatus() {
+            fetch('/auth/check/' + pinId)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        clearInterval(pollInterval);
+                        document.getElementById('statusText').textContent = 'Authentication successful! Redirecting...';
+                        setTimeout(() => {
+                            window.location.href = data.redirect;
+                        }, 1000);
+                    } else if (data.status === 'expired' || data.status === 'error') {
+                        clearInterval(pollInterval);
+                        document.getElementById('statusText').textContent = data.message || 'Authentication failed';
+                        setTimeout(() => {
+                            window.location.reload();
+                        }, 3000);
                     }
-                } else {
-                    const data = await response.json();
-                    errorDiv.textContent = data.error || 'Authentication failed';
-                    errorDiv.style.display = 'block';
-                }
-            } catch (error) {
-                errorDiv.textContent = 'Connection error. Please try again.';
-                errorDiv.style.display = 'block';
+                    // Otherwise keep polling (status === 'waiting')
+                })
+                .catch(error => {
+                    console.error('Auth check failed:', error);
+                });
+        }
+        
+        // Auto-start polling if user returns to this page
+        window.addEventListener('focus', () => {
+            if (!polling) {
+                startPolling();
             }
         });
     </script>
 </body>
 </html>
     `;
+  }
+
+  generateWaitingPage() {
+    return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Authentication Complete</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0;
+        }
+        .container {
+            background: white;
+            padding: 3rem;
+            border-radius: 15px;
+            box-shadow: 0 15px 35px rgba(0,0,0,0.2);
+            text-align: center;
+            max-width: 400px;
+        }
+        .success {
+            color: #4caf50;
+            font-size: 3rem;
+            margin-bottom: 1rem;
+        }
+        h2 {
+            color: #333;
+            margin-bottom: 1rem;
+        }
+        p {
+            color: #666;
+            line-height: 1.5;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="success">?</div>
+        <h2>Authentication Successful!</h2>
+        <p>You can close this window and return to the previous tab.</p>
+    </div>
+    
+    <script>
+        // Auto-close this window after a few seconds
+        setTimeout(() => {
+            window.close();
+        }, 3000);
+    </script>
+</body>
+</html>
+    `;
+  }
+
+  cleanupPendingAuth() {
+    const now = Date.now();
+    const fifteenMinutes = 15 * 60 * 1000;
+    
+    for (const [pinId, data] of this.pendingAuth.entries()) {
+      if (now - data.timestamp > fifteenMinutes) {
+        this.pendingAuth.delete(pinId);
+      }
+    }
   }
 
   start() {
