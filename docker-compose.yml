@@ -13,17 +13,4 @@ services:
     environment:
       - NODE_ENV=production
       - CONFIG_PATH=/app/config/config.yaml
-    networks:
-      - proxy-network
-    healthcheck:
-      test: ["CMD", "node", "healthcheck.js"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-
-networks:
-  proxy-network:
-    external: true
-    # This should match your NPM network name
-    # You may need to change this to match your existing network
+      - TZ=America/Chicago
