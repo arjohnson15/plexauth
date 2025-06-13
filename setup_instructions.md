@@ -56,7 +56,7 @@ access_rules:
   "site1.yourdomain.com":
     type: "user_whitelist"
     allowed_users:
-      - "arjohnson15@gmail.com"  # Change to your email
+      - "user@gmail.com"  # Change to your email
     allowed_servers:
       - "plex1"
       - "plex2"
