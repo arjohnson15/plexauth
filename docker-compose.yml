@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  plex-auth-proxy:
+    build: .
+    container_name: plex-auth-proxy
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+    environment:
+      - NODE_ENV=production
+      - CONFIG_PATH=/app/config/config.yaml
+    networks:
+      - proxy-network
+    healthcheck:
+      test: ["CMD", "node", "healthcheck.js"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  proxy-network:
+    external: true
+    # This should match your NPM network name
+    # You may need to change this to match your existing network

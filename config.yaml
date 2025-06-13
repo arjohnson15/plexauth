@@ -1,0 +1,89 @@
+# Plex Authentication Proxy Configuration
+app:
+  port: 3000
+  session_secret: "your-super-secret-session-key-change-this"
+  jwt_secret: "your-jwt-secret-change-this"
+  cookie_domain: ".me.com"  # Set to your domain
+  redirect_after_auth: true
+  debug: false
+
+# Plex Server Configurations
+plex_servers:
+  plex1:
+    name: "Main Plex Server"
+    url: "http://192.168.1.100:32400"
+    token: "your-plex-token-here"
+    machine_id: "your-machine-id-here"
+  plex2:
+    name: "Secondary Plex Server" 
+    url: "http://192.168.1.101:32400"
+    token: "your-second-plex-token-here"
+    machine_id: "your-second-machine-id-here"
+
+# URL Access Rules
+access_rules:
+  # Site 1: Only specific user from either server
+  "site1.me.com":
+    type: "user_whitelist"
+    allowed_users:
+      - "arjohnson15@gmail.com"
+    allowed_servers:
+      - "plex1"
+      - "plex2"
+    redirect_to: null
+    
+  # Site 2: Any member from any server
+  "site2.me.com":
+    type: "any_member"
+    allowed_servers:
+      - "plex1" 
+      - "plex2"
+    redirect_to: null
+    
+  # Site 3: Conditional redirects based on server membership
+  "site3.me.com":
+    type: "conditional_redirect"
+    conditions:
+      - server: "plex1"
+        redirect_to: "http://192.168.2.2:3232"
+      - server: "plex2"
+        redirect_to: "http://192.168.2.2:3234"
+    fallback_redirect: null  # or set a default URL
+
+# Additional rule types you can use:
+  # Admin-only access
+  # "admin.me.com":
+  #   type: "admin_only"
+  #   allowed_servers:
+  #     - "plex1"
+  
+  # Friend access (shared library users)
+  # "friends.me.com":
+  #   type: "friends_allowed"
+  #   allowed_servers:
+  #     - "plex1"
+  
+  # Time-based access
+  # "timelock.me.com":
+  #   type: "time_restricted"
+  #   allowed_hours:
+  #     start: "09:00"
+  #     end: "17:00"
+  #   allowed_days: ["monday", "tuesday", "wednesday", "thursday", "friday"]
+  #   allowed_servers:
+  #     - "plex1"
+
+# Security Settings
+security:
+  rate_limit:
+    window_ms: 900000  # 15 minutes
+    max_requests: 100
+  session_timeout: 3600  # 1 hour in seconds
+  require_https: true
+  trusted_proxies:
+    - "192.168.1.0/24"  # Your network range
+  
+# Logging
+logging:
+  level: "info"  # debug, info, warn, error
+  log_file: "/app/logs/auth.log"
