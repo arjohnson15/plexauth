@@ -26,7 +26,7 @@ access_rules:
   "site1.me.com":
     type: "user_whitelist"
     allowed_users:
-      - "arjohnson15@gmail.com"
+      - "user@gmail.com"
     allowed_servers:
       - "plex1"
       - "plex2"
