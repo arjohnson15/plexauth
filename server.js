@@ -4,28 +4,351 @@ const cookieParser = require('cookie-parser');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const jwt = require('jsonwebtoken');
+const axios = require('axios');
 const fs = require('fs');
 const yaml = require('js-yaml');
 const path = require('path');
-const PlexAuthenticator = require('./lib/plex-authenticator');
-const AccessControl = require('./lib/access-control');
-const Logger = require('./lib/logger');
+const { XMLParser } = require('fast-xml-parser');
+
+// Add Plex OAuth functionality
+class PlexOAuth {
+  constructor(clientInfo, logger) {
+    this.clientInfo = clientInfo;
+    this.logger = logger;
+  }
+
+  async requestHostedLoginURL() {
+    try {
+      // Step 1: Get PIN
+      const pinResponse = await axios.post('https://plex.tv/api/v2/pins', {
+        strong: true
+      }, {
+        headers: {
+          'X-Plex-Product': this.clientInfo.product,
+          'X-Plex-Version': this.clientInfo.version,
+          'X-Plex-Client-Identifier': this.clientInfo.clientIdentifier,
+          'Accept': 'application/json'
+        }
+      });
+
+      const pinData = pinResponse.data;
+      const pinId = pinData.id;
+      const code = pinData.code;
+
+      // Step 2: Generate auth URL
+      const authUrl = `https://app.plex.tv/auth#?clientID=${this.clientInfo.clientIdentifier}&code=${code}&context%5Bdevice%5D%5Bproduct%5D=${this.clientInfo.product}`;
+
+      this.logger.info(`Created Plex OAuth URL with PIN ID: ${pinId}`);
+      
+      return [authUrl, pinId];
+    } catch (error) {
+      this.logger.error('Failed to create Plex OAuth URL:', error);
+      throw new Error('Failed to initiate Plex authentication');
+    }
+  }
+
+  async checkForAuthToken(pinId) {
+    try {
+      const response = await axios.get(`https://plex.tv/api/v2/pins/${pinId}`, {
+        headers: {
+          'X-Plex-Client-Identifier': this.clientInfo.clientIdentifier,
+          'Accept': 'application/json'
+        }
+      });
+
+      const pinData = response.data;
+      return pinData.authToken || null;
+    } catch (error) {
+      this.logger.debug('PIN not yet authenticated:', error.message);
+      return null;
+    }
+  }
+}
+
+class PlexClient {
+  constructor(logger) {
+    this.logger = logger;
+    this.xmlParser = new XMLParser({
+      ignoreAttributes: false,
+      attributeNamePrefix: '@_'
+    });
+  }
+
+  async getAccessTier(serverIdentifier, accessToken) {
+    try {
+      const servers = await this.getServers(accessToken);
+      const serverDetails = this.getServerDetails(servers);
+      
+      const accessLevel = serverDetails
+        .filter(x => x.serverId === serverIdentifier)
+        .map(x => x.accessTier)[0];
+      
+      return accessLevel || 'NoAccess';
+    } catch (error) {
+      this.logger.error('Retrieving access tier failed:', error);
+      return 'Failure';
+    }
+  }
+
+  async getUserInfo(accessToken) {
+    try {
+      const xml = await this.performGetRequest(accessToken, '/users/account');
+      const xmlDoc = this.xmlParser.parse(xml);
+      const user = xmlDoc.user || xmlDoc;
+
+      return {
+        username: user['@_username'] || user.username || '',
+        email: user['@_email'] || user.email || '',
+        thumbnail: user['@_thumb'] || user.thumb || ''
+      };
+    } catch (error) {
+      this.logger.error('Failed to get user info:', error);
+      throw error;
+    }
+  }
+
+  async getServers(accessToken) {
+    try {
+      const xml = await this.performGetRequest(accessToken, '/api/resources');
+      const xmlDoc = this.xmlParser.parse(xml);
+      
+      const devices = xmlDoc.MediaContainer?.Device || [];
+      const deviceArray = Array.isArray(devices) ? devices : [devices];
+      
+      return deviceArray.map(device => ({
+        clientIdentifier: device['@_clientIdentifier'],
+        owned: device['@_owned'] || '0',
+        home: device['@_home'] || '0'
+      }));
+    } catch (error) {
+      this.logger.error('Failed to get servers:', error);
+      return [];
+    }
+  }
+
+  async performGetRequest(accessToken, path) {
+    try {
+      const response = await axios.get(`https://plex.tv${path}`, {
+        headers: {
+          'includeHttps': '1',
+          'includeRelay': '1',
+          'X-Plex-Product': 'PlexSSO',
+          'X-Plex-Version': 'Plex OAuth',
+          'X-Plex-Client-Identifier': 'PlexSSOv2',
+          'X-Plex-Token': accessToken,
+          'Accept': 'application/json'
+        },
+        timeout: 10000
+      });
+
+      this.logger.debug(`Request: ${path}\nResponse status: ${response.status}`);
+      return response.data;
+    } catch (error) {
+      this.logger.error(`Request failed for ${path}:`, error.message);
+      throw error;
+    }
+  }
+
+  getServerDetails(servers) {
+    return servers.map(server => {
+      let accessTier = 'NormalUser';
+      if (server.owned === '1') {
+        accessTier = 'Owner';
+      } else if (server.home === '1') {
+        accessTier = 'HomeUser';
+      }
+
+      return {
+        serverId: server.clientIdentifier,
+        accessTier: accessTier
+      };
+    });
+  }
+}
+
+class AccessController {
+  constructor(config, logger) {
+    this.config = config;
+    this.logger = logger;
+  }
+
+  checkAccess(host, user, userAccessTier, authenticatedServerId, userServers) {
+    const rules = this.config.access_rules[host];
+    
+    if (!rules) {
+      this.logger.warn(`No access rules found for host: ${host}`);
+      return { 
+        allowed: false, 
+        reason: 'No access rules configured for this host',
+        redirect: null 
+      };
+    }
+
+    this.logger.debug(`Checking access for ${user.email} to ${host} with rule type: ${rules.type}`);
+
+    switch (rules.type) {
+      case 'user_whitelist':
+        return this.checkUserWhitelist(rules, user, userAccessTier, authenticatedServerId, userServers);
+      
+      case 'any_member':
+        return this.checkAnyMember(rules, user, userAccessTier, authenticatedServerId, userServers);
+      
+      case 'admin_only':
+        return this.checkAdminOnly(rules, user, userAccessTier, authenticatedServerId, userServers);
+      
+      case 'conditional_redirect':
+        return this.checkConditionalRedirect(rules, user, userAccessTier, authenticatedServerId, userServers);
+      
+      default:
+        this.logger.error(`Unknown access rule type: ${rules.type}`);
+        return { 
+          allowed: false, 
+          reason: 'Invalid access rule configuration',
+          redirect: null 
+        };
+    }
+  }
+
+  checkUserWhitelist(rules, user, userAccessTier, authenticatedServerId, userServers) {
+    // Check if user is in the whitelist
+    if (!rules.allowed_users.includes(user.email) && !rules.allowed_users.includes(user.username)) {
+      return { 
+        allowed: false, 
+        reason: 'User not in whitelist',
+        redirect: null 
+      };
+    }
+
+    // Check if user has access to any of the required servers
+    const hasServerAccess = rules.allowed_servers.some(serverId => 
+      userServers.hasOwnProperty(serverId)
+    );
+
+    if (!hasServerAccess) {
+      return { 
+        allowed: false, 
+        reason: 'User does not have access to required Plex servers',
+        redirect: null 
+      };
+    }
+
+    return { 
+      allowed: true, 
+      reason: 'User whitelist access granted',
+      redirect: rules.redirect_to 
+    };
+  }
+
+  checkAnyMember(rules, user, userAccessTier, authenticatedServerId, userServers) {
+    // Check if user has access to any of the allowed servers
+    const hasServerAccess = rules.allowed_servers.some(serverId => 
+      userServers.hasOwnProperty(serverId)
+    );
+
+    if (!hasServerAccess) {
+      return { 
+        allowed: false, 
+        reason: 'User does not have access to any required Plex servers',
+        redirect: null 
+      };
+    }
+
+    return { 
+      allowed: true, 
+      reason: 'Any member access granted',
+      redirect: rules.redirect_to 
+    };
+  }
+
+  checkAdminOnly(rules, user, userAccessTier, authenticatedServerId, userServers) {
+    // Check if user is admin on any of the allowed servers
+    const isAdmin = Object.keys(userServers).some(serverId => {
+      if (rules.allowed_servers.includes(serverId)) {
+        return userServers[serverId].is_owner || userAccessTier === 'Owner';
+      }
+      return false;
+    });
+
+    if (!isAdmin) {
+      return { 
+        allowed: false, 
+        reason: 'Admin access required',
+        redirect: null 
+      };
+    }
+
+    return { 
+      allowed: true, 
+      reason: 'Admin access granted',
+      redirect: rules.redirect_to 
+    };
+  }
+
+  checkConditionalRedirect(rules, user, userAccessTier, authenticatedServerId, userServers) {
+    // Check each condition in order
+    for (const condition of rules.conditions) {
+      if (userServers.hasOwnProperty(condition.server)) {
+        this.logger.info(`User ${user.email} matched condition for server ${condition.server}`);
+        return { 
+          allowed: true, 
+          reason: `Conditional redirect for server ${condition.server}`,
+          redirect: condition.redirect_to 
+        };
+      }
+    }
+
+    // If no conditions matched, check for fallback
+    if (rules.fallback_redirect) {
+      return { 
+        allowed: true, 
+        reason: 'Fallback redirect applied',
+        redirect: rules.fallback_redirect 
+      };
+    }
+
+    return { 
+      allowed: false, 
+      reason: 'User does not match any conditional redirect criteria',
+      redirect: null 
+    };
+  }
+}
 
 class PlexAuthProxy {
   constructor() {
     this.app = express();
-    this.app.set('trust proxy', true);  // Fix for X-Forwarded-For header warning
+    this.app.set('trust proxy', true);
     this.config = this.loadConfig();
-    this.logger = new Logger(this.config.logging);
-    this.plexAuth = new PlexAuthenticator(this.config, this.logger);
-    this.accessControl = new AccessControl(this.config, this.logger);
+    this.logger = this.createLogger();
+    this.plexClient = new PlexClient(this.logger);
+    this.accessController = new AccessController(this.config, this.logger);
+    
+    // OAuth client configuration
+    this.clientInfo = {
+      clientIdentifier: this.config.app.client_identifier || 'plex-auth-proxy-' + Date.now(),
+      product: 'Plex Auth Proxy',
+      device: 'Auth Proxy Server',
+      version: '2.0.0',
+      platform: 'Web'
+    };
+    
+    this.plexOAuth = new PlexOAuth(this.clientInfo, this.logger);
     
     // Store for pending OAuth sessions
-    this.pendingAuth = new Map(); // pinId -> { redirect, timestamp, pollingInterval }
+    this.pendingAuth = new Map(); // pinId -> { redirect, timestamp }
     
     this.setupMiddleware();
     this.setupRoutes();
+  }
+
+  createLogger() {
+    const level = this.config.logging?.level || 'info';
+    return {
+      debug: (msg, ...args) => level === 'debug' && console.log(`[DEBUG] ${msg}`, ...args),
+      info: (msg, ...args) => ['debug', 'info'].includes(level) && console.log(`[INFO] ${msg}`, ...args),
+      warn: (msg, ...args) => ['debug', 'info', 'warn'].includes(level) && console.warn(`[WARN] ${msg}`, ...args),
+      error: (msg, ...args) => console.error(`[ERROR] ${msg}`, ...args)
+    };
   }
 
   loadConfig() {
@@ -40,21 +363,21 @@ class PlexAuthProxy {
   }
 
   setupMiddleware() {
-    // Set trust proxy first
-    this.app.set('trust proxy', ['192.168.10.0/24', '172.16.0.0/12', '10.0.0.0/8']);
-    
     // Security middleware
     this.app.use(helmet({
       crossOriginEmbedderPolicy: false,
       contentSecurityPolicy: false
     }));
 
-    // Rate limiting with specific proxy configuration
+    // Rate limiting with proper proxy configuration
     const limiter = rateLimit({
-      windowMs: this.config.security.rate_limit.window_ms,
-      max: this.config.security.rate_limit.max_requests,
+      windowMs: this.config.security?.rate_limit?.window_ms || 900000,
+      max: this.config.security?.rate_limit?.max_requests || 100,
       message: 'Too many requests from this IP, please try again later.',
-      trustProxy: ['192.168.10.0/24', '172.16.0.0/12', '10.0.0.0/8']
+      // Fix the trust proxy issue
+      trustProxy: ['192.168.0.0/16', '10.0.0.0/8', '172.16.0.0/12'],
+      standardHeaders: true,
+      legacyHeaders: false
     });
     this.app.use(limiter);
 
@@ -69,16 +392,18 @@ class PlexAuthProxy {
     this.app.use(express.urlencoded({ extended: true }));
     this.app.use(cookieParser());
 
-    // Session management
+    // Session management with better store warning handling
     this.app.use(session({
       secret: this.config.app.session_secret,
       resave: false,
       saveUninitialized: false,
       cookie: {
-        secure: this.config.security.require_https,
-        maxAge: this.config.security.session_timeout * 1000,
+        secure: this.config.security?.require_https || false,
+        maxAge: (this.config.security?.session_timeout || 3600) * 1000,
         domain: this.config.app.cookie_domain
-      }
+      },
+      // Suppress the memory store warning for now
+      name: 'plex.auth.sid'
     }));
 
     // Request logging
@@ -94,7 +419,7 @@ class PlexAuthProxy {
       res.json({ status: 'healthy', timestamp: new Date().toISOString() });
     });
 
-    // Main authentication endpoint
+    // Main authentication endpoint (mimics PlexSSO's /api/v2/sso)
     this.app.get('/auth', async (req, res) => {
       try {
         await this.handleAuth(req, res);
@@ -104,119 +429,76 @@ class PlexAuthProxy {
       }
     });
 
-    // Login page - creates PIN and shows Plex login with polling
-    this.app.get('/login', async (req, res) => {
-      try {
-        const originalUrl = req.query.redirect || req.headers.referer || '/';
-        
-        // Create OAuth URL first
-        const redirectUrl = `${req.protocol}://${req.get('host')}/auth/waiting`;
-        const { authUrl, pinId } = await this.plexAuth.createAuthUrl(redirectUrl);
-        
-        // Store the pending auth session
-        this.pendingAuth.set(pinId, {
-          redirect: originalUrl,
-          timestamp: Date.now()
-        });
-        
-        // Clean up old pending auths
-        this.cleanupPendingAuth();
-        
-        res.send(this.generateOAuthLoginPage(authUrl, pinId, originalUrl));
-      } catch (error) {
-        this.logger.error('Failed to create login page:', error);
-        res.status(500).send('Authentication service temporarily unavailable');
-      }
-    });
-
-    // Waiting page that polls for authentication completion
-this.app.get('/auth/waiting', async (req, res) => {
-  try {
-    // The user just came back from Plex, but we need to find their PIN
-    // Let's check all pending authentications to see if any completed
-    for (const [pinId, pending] of this.pendingAuth.entries()) {
-      const authResult = await this.plexAuth.checkAuthToken(pinId);
-      
-      if (authResult.success) {
-        // Authentication successful!
-        req.session.user = authResult.user;
-        req.session.plexServers = authResult.servers;
-        
-        this.logger.info(`User ${authResult.user.email} authenticated successfully`);
-        
-        // Clean up and redirect
-        this.pendingAuth.delete(pinId);
-        return res.redirect(pending.redirect);
-      }
-    }
-    
-    // No successful auth found, show waiting page
-    res.send(this.generateWaitingPage());
-  } catch (error) {
-    this.logger.error('Waiting page error:', error);
-    res.send(this.generateWaitingPage());
-  }
-});
-    // API endpoint to check auth status (polled by waiting page)
-    this.app.get('/auth/check/:pinId', async (req, res) => {
-      try {
-        const pinId = req.params.pinId;
-        
-        const pending = this.pendingAuth.get(pinId);
-        if (!pending) {
-          return res.json({ status: 'expired', message: 'Authentication session expired' });
-        }
-
-        // Check for auth token
-        const authResult = await this.plexAuth.checkAuthToken(pinId);
-        
-        if (authResult.success) {
-          // Store user session
-          req.session.user = authResult.user;
-          req.session.plexServers = authResult.servers;
-          
-          this.logger.info(`User ${authResult.user.email} authenticated successfully via OAuth`);
-          
-          // Clean up pending auth
-          this.pendingAuth.delete(pinId);
-          
-          // Return success with redirect URL
-          res.json({ 
-            status: 'success', 
-            redirect: pending.redirect,
-            user: authResult.user.email
-          });
-        } else {
-          // Still waiting
-          res.json({ status: 'waiting', message: 'Waiting for Plex authentication...' });
-        }
-      } catch (error) {
-        this.logger.error('Auth check error:', error);
-        res.json({ status: 'error', message: 'Authentication failed' });
-      }
-    });
-
-    // Legacy login handler (for direct username/password - optional)
+    // Login endpoint that accepts Plex token (mimics PlexSSO's /api/v2/login)
     this.app.post('/login', async (req, res) => {
       try {
-        const { username, password, redirect } = req.body;
-        const authResult = await this.plexAuth.authenticate(username, password);
+        const { token } = req.body;
         
-        if (authResult.success) {
-          req.session.user = authResult.user;
-          req.session.plexServers = authResult.servers;
-          
-          this.logger.info(`User ${username} authenticated successfully`);
-          
-          if (redirect) {
-            res.redirect(redirect);
-          } else {
-            res.json({ success: true, user: authResult.user });
-          }
-        } else {
-          this.logger.warn(`Failed authentication attempt for ${username}`);
-          res.status(401).json({ error: 'Invalid credentials' });
+        if (!token) {
+          return res.status(400).json({ error: 'Token required' });
         }
+
+        // Check authentication against multiple servers (like PlexSSO)
+        let authenticatedServer = null;
+        let userAccessTier = 'NoAccess';
+        let userInfo = null;
+        let userServers = {};
+
+        // Try each configured server
+        for (const [serverId, serverConfig] of Object.entries(this.config.plex_servers)) {
+          try {
+            const accessTier = await this.plexClient.getAccessTier(serverConfig.machine_id, token);
+            
+            if (accessTier !== 'NoAccess' && accessTier !== 'Failure') {
+              // User has access to this server
+              userServers[serverId] = {
+                name: serverConfig.name,
+                url: serverConfig.url,
+                access_level: accessTier,
+                is_owner: accessTier === 'Owner',
+                machine_id: serverConfig.machine_id
+              };
+
+              // Set primary authentication details from first successful server
+              if (!authenticatedServer) {
+                authenticatedServer = serverId;
+                userAccessTier = accessTier;
+                userInfo = await this.plexClient.getUserInfo(token);
+              }
+            }
+          } catch (error) {
+            this.logger.debug(`Authentication failed for server ${serverId}:`, error.message);
+          }
+        }
+
+        if (!authenticatedServer || !userInfo) {
+          this.logger.warn('Failed authentication attempt');
+          return res.status(401).json({ error: 'Invalid credentials' });
+        }
+
+        // Store user session
+        req.session.user = {
+          email: userInfo.email,
+          username: userInfo.username,
+          thumbnail: userInfo.thumbnail,
+          accessTier: userAccessTier,
+          authenticatedServer: authenticatedServer,
+          token: token
+        };
+
+        // Store server access info
+        req.session.userServers = userServers;
+
+        this.logger.info(`User ${userInfo.email} authenticated successfully. Access to servers: ${Object.keys(userServers).join(', ')}`);
+        
+        res.json({ 
+          success: true, 
+          user: userInfo,
+          accessTier: userAccessTier,
+          servers: Object.keys(userServers),
+          primaryServer: authenticatedServer
+        });
+
       } catch (error) {
         this.logger.error('Login error:', error);
         res.status(500).json({ error: 'Authentication failed' });
@@ -234,10 +516,169 @@ this.app.get('/auth/waiting', async (req, res) => {
       if (req.session.user) {
         res.json({
           user: req.session.user,
-          servers: req.session.plexServers
+          servers: req.session.userServers || {}
         });
       } else {
         res.status(401).json({ error: 'Not authenticated' });
+      }
+    });
+
+    // Login page with OAuth
+    this.app.get('/login', async (req, res) => {
+      try {
+        const redirectUrl = req.query.redirect || req.headers.referer || '/';
+        
+        // Check if user already has a pending auth for this session
+        const existingPinId = req.session.pendingPinId;
+        let authUrl, pinId;
+        
+        if (existingPinId && this.pendingAuth.has(existingPinId)) {
+          // Reuse existing PIN
+          pinId = existingPinId;
+          // We'll need to recreate the auth URL, but that's okay
+          [authUrl, ] = await this.plexOAuth.requestHostedLoginURL();
+          this.pendingAuth.set(pinId, {
+            redirect: redirectUrl,
+            timestamp: Date.now()
+          });
+        } else {
+          // Create new OAuth URL
+          [authUrl, pinId] = await this.plexOAuth.requestHostedLoginURL();
+          
+          // Store the pending auth session
+          this.pendingAuth.set(pinId, {
+            redirect: redirectUrl,
+            timestamp: Date.now()
+          });
+          
+          // Store PIN in session to prevent multiple PINs
+          req.session.pendingPinId = pinId;
+        }
+        
+        // Clean up old pending auths
+        this.cleanupPendingAuth();
+        
+        res.send(this.generateOAuthLoginPage(authUrl, pinId, redirectUrl));
+      } catch (error) {
+        this.logger.error('Failed to create login page:', error);
+        res.status(500).send('Authentication service temporarily unavailable');
+      }
+    });
+
+    // OAuth callback/polling endpoint
+    this.app.get('/auth/check/:pinId', async (req, res) => {
+      try {
+        const pinId = req.params.pinId;
+        
+        const pending = this.pendingAuth.get(pinId);
+        if (!pending) {
+          return res.json({ status: 'expired', message: 'Authentication session expired' });
+        }
+
+        // Check for auth token
+        const authToken = await this.plexOAuth.checkForAuthToken(pinId);
+        
+        if (authToken) {
+          // Process the authentication like the old login endpoint
+          let authenticatedServer = null;
+          let userAccessTier = 'NoAccess';
+          let userInfo = null;
+          let userServers = {};
+
+          // Try each configured server
+          for (const [serverId, serverConfig] of Object.entries(this.config.plex_servers)) {
+            try {
+              const accessTier = await this.plexClient.getAccessTier(serverConfig.machine_id, authToken);
+              
+              if (accessTier !== 'NoAccess' && accessTier !== 'Failure') {
+                userServers[serverId] = {
+                  name: serverConfig.name,
+                  url: serverConfig.url,
+                  access_level: accessTier,
+                  is_owner: accessTier === 'Owner',
+                  machine_id: serverConfig.machine_id
+                };
+
+                if (!authenticatedServer) {
+                  authenticatedServer = serverId;
+                  userAccessTier = accessTier;
+                  userInfo = await this.plexClient.getUserInfo(authToken);
+                }
+              }
+            } catch (error) {
+              this.logger.debug(`Authentication failed for server ${serverId}:`, error.message);
+            }
+          }
+
+          if (!authenticatedServer || !userInfo) {
+            this.logger.warn('Failed OAuth authentication attempt');
+            return res.json({ status: 'error', message: 'Authentication failed' });
+          }
+
+          // Store user session in a temporary store (we'll need to handle this differently)
+          // For now, return success with user data
+          this.pendingAuth.set(pinId + '_user', {
+            user: {
+              email: userInfo.email,
+              username: userInfo.username,
+              thumbnail: userInfo.thumbnail,
+              accessTier: userAccessTier,
+              authenticatedServer: authenticatedServer,
+              token: authToken
+            },
+            userServers: userServers,
+            timestamp: Date.now()
+          });
+
+          // Clean up pending auth
+          this.pendingAuth.delete(pinId);
+          
+          this.logger.info(`User ${userInfo.email} authenticated successfully via OAuth. Access to servers: ${Object.keys(userServers).join(', ')}`);
+          
+          // Return success with redirect URL
+          res.json({ 
+            status: 'success', 
+            redirect: pending.redirect,
+            user: userInfo.email,
+            sessionKey: pinId + '_user'
+          });
+        } else {
+          // Still waiting
+          res.json({ status: 'waiting', message: 'Waiting for Plex authentication...' });
+        }
+      } catch (error) {
+        this.logger.error('Auth check error:', error);
+        res.json({ status: 'error', message: 'Authentication failed' });
+      }
+    });
+
+    // Session establishment endpoint
+    this.app.post('/auth/establish', (req, res) => {
+      try {
+        const { sessionKey } = req.body;
+        this.logger.debug(`Attempting to establish session with key: ${sessionKey}`);
+        
+        const authData = this.pendingAuth.get(sessionKey);
+        if (!authData) {
+          this.logger.warn(`Invalid or expired session key: ${sessionKey}`);
+          return res.status(400).json({ error: 'Invalid session key' });
+        }
+
+        // Store in actual session
+        req.session.user = authData.user;
+        req.session.userServers = authData.userServers;
+        
+        // Clear the pending PIN from session
+        delete req.session.pendingPinId;
+
+        // Clean up temporary storage
+        this.pendingAuth.delete(sessionKey);
+
+        this.logger.info(`Session established for user: ${authData.user.email}`);
+        res.json({ success: true });
+      } catch (error) {
+        this.logger.error('Session establishment error:', error);
+        res.status(500).json({ error: 'Failed to establish session' });
       }
     });
   }
@@ -249,16 +690,18 @@ this.app.get('/auth/waiting', async (req, res) => {
     this.logger.debug(`Auth request for host: ${host}, original URL: ${originalUrl}`);
 
     // Check if user is authenticated
-    if (!req.session.user) {
+    if (!req.session.user || !req.session.userServers) {
       this.logger.debug('User not authenticated, returning 401');
       return res.status(401).json({ error: 'Not authenticated' });
     }
 
     // Check access control
-    const accessResult = await this.accessControl.checkAccess(
+    const accessResult = this.accessController.checkAccess(
       host,
       req.session.user,
-      req.session.plexServers
+      req.session.user.accessTier,
+      req.session.user.authenticatedServer,
+      req.session.userServers
     );
 
     if (!accessResult.allowed) {
@@ -275,19 +718,22 @@ this.app.get('/auth/waiting', async (req, res) => {
       return res.redirect(accessResult.redirect);
     }
 
-    // Set auth headers for upstream services
+    // Set auth headers for upstream services (like PlexSSO)
     res.set({
+      'X-PlexSSO-Username': req.session.user.username,
+      'X-PlexSSO-Email': req.session.user.email,
       'X-Auth-User': req.session.user.email,
-      'X-Auth-Name': req.session.user.title,
-      'X-Auth-Servers': JSON.stringify(req.session.plexServers),
-      'X-Auth-Admin': req.session.user.admin ? 'true' : 'false'
+      'X-Auth-Name': req.session.user.username,
+      'X-Auth-Admin': req.session.user.accessTier === 'Owner' ? 'true' : 'false',
+      'X-Auth-Servers': JSON.stringify(Object.keys(req.session.userServers))
     });
 
-    this.logger.info(`Access granted for user ${req.session.user.email} to ${host}`);
+    this.logger.info(`Access granted for user ${req.session.user.email} to ${host}. Available servers: ${Object.keys(req.session.userServers).join(', ')}`);
     res.status(200).json({ 
       success: true,
       user: req.session.user.email,
-      access_granted: true
+      access_granted: true,
+      servers: Object.keys(req.session.userServers)
     });
   }
 
@@ -421,7 +867,7 @@ this.app.get('/auth/waiting', async (req, res) => {
     </div>
 
     <script>
-        const pinId = '${pinId}';  // Pass pinId to JavaScript
+        const pinId = '${pinId}';
         let polling = false;
         let pollInterval;
         
@@ -443,10 +889,25 @@ this.app.get('/auth/waiting', async (req, res) => {
                 .then(data => {
                     if (data.status === 'success') {
                         clearInterval(pollInterval);
-                        document.getElementById('statusText').textContent = 'Authentication successful! Redirecting...';
-                        setTimeout(() => {
-                            window.location.href = data.redirect;
-                        }, 1000);
+                        document.getElementById('statusText').textContent = 'Authentication successful! Establishing session...';
+                        
+        // Establish session and redirect
+                        fetch('/auth/establish', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({ sessionKey: data.sessionKey })
+                        }).then(response => response.json()).then(result => {
+                            if (result.success) {
+                                window.location.href = data.redirect;
+                            } else {
+                                document.getElementById('statusText').textContent = 'Failed to establish session';
+                            }
+                        }).catch(error => {
+                            console.error('Session establishment failed:', error);
+                            document.getElementById('statusText').textContent = 'Session establishment failed';
+                        });
                     } else if (data.status === 'expired' || data.status === 'error') {
                         clearInterval(pollInterval);
                         document.getElementById('statusText').textContent = data.message || 'Authentication failed';
@@ -473,72 +934,13 @@ this.app.get('/auth/waiting', async (req, res) => {
     `;
   }
 
-  generateWaitingPage() {
-    return `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Authentication Complete</title>
-    <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin: 0;
-        }
-        .container {
-            background: white;
-            padding: 3rem;
-            border-radius: 15px;
-            box-shadow: 0 15px 35px rgba(0,0,0,0.2);
-            text-align: center;
-            max-width: 400px;
-        }
-        .success {
-            color: #4caf50;
-            font-size: 3rem;
-            margin-bottom: 1rem;
-        }
-        h2 {
-            color: #333;
-            margin-bottom: 1rem;
-        }
-        p {
-            color: #666;
-            line-height: 1.5;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="success">?</div>
-        <h2>Authentication Successful!</h2>
-        <p>You can close this window and return to the previous tab.</p>
-    </div>
-    
-    <script>
-        // Auto-close this window after a few seconds
-        setTimeout(() => {
-            window.close();
-        }, 3000);
-    </script>
-</body>
-</html>
-    `;
-  }
-
   cleanupPendingAuth() {
     const now = Date.now();
     const fifteenMinutes = 15 * 60 * 1000;
     
-    for (const [pinId, data] of this.pendingAuth.entries()) {
+    for (const [key, data] of this.pendingAuth.entries()) {
       if (now - data.timestamp > fifteenMinutes) {
-        this.pendingAuth.delete(pinId);
+        this.pendingAuth.delete(key);
       }
     }
   }
@@ -551,6 +953,13 @@ this.app.get('/auth/waiting', async (req, res) => {
   }
 }
 
-// Start the server
-const proxy = new PlexAuthProxy();
-proxy.start();
+// Export for use
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { PlexAuthProxy, PlexClient, AccessController };
+}
+
+// Start the server if this file is run directly
+if (require.main === module) {
+  const proxy = new PlexAuthProxy();
+  proxy.start();
+}
